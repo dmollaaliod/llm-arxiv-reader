@@ -1,0 +1,4 @@
+anthropic>=0.50.0
+rich>=13.0.0
+python-dotenv
+textual>=0.80.0
