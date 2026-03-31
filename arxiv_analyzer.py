@@ -361,24 +361,18 @@ def run_analysis(topics: list[dict], digest: str) -> list[dict]:
 _TABLE_CSS = """
 <style>
 table.arxiv-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.88em;
-    font-family: inherit;
+    width: 100%; border-collapse: collapse;
+    font-size: 0.88em; font-family: inherit;
 }
 table.arxiv-table th {
-    padding: 8px 12px;
-    text-align: left;
+    padding: 8px 12px; text-align: left;
     border-bottom: 2px solid rgba(128,128,128,0.4);
-    white-space: nowrap;
-    background: rgba(128,128,128,0.08);
+    white-space: nowrap; background: rgba(128,128,128,0.08);
 }
 table.arxiv-table td {
     padding: 8px 12px;
     border-bottom: 1px solid rgba(128,128,128,0.15);
-    vertical-align: top;
-    white-space: normal;
-    word-break: break-word;
+    vertical-align: top; white-space: normal; word-break: break-word;
 }
 table.arxiv-table tr:hover td { background: rgba(128,128,128,0.05); }
 .col-topic   { width:  9%; min-width: 80px; }
@@ -402,7 +396,6 @@ a.paper-link:hover { text-decoration: underline; }
 </style>
 """
 
-
 # 20 visually distinct colours (Matplotlib tab20)
 _TOPIC_PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -413,7 +406,6 @@ _TOPIC_PALETTE = [
 
 
 def _topic_color_map(all_keys: list[str]) -> dict[str, str]:
-    """Assign a stable colour to each topic key."""
     return {
         key: _TOPIC_PALETTE[i % len(_TOPIC_PALETTE)]
         for i, key in enumerate(sorted(all_keys))
@@ -437,7 +429,12 @@ def _score_pips(score: int, max_score: int = 5) -> str:
     return f'{"".join(pips)} <small>{score}</small>'
 
 
-def _build_html_table(papers: list[dict], color_map: dict[str, str]) -> str:
+def _build_html_table(
+    papers: list[dict],
+    color_map: dict[str, str],
+    sort_col: str,
+    sort_asc: bool,
+) -> str:
     rows = []
     for p in papers:
         title      = html_mod.escape(p.get("title", ""))
@@ -458,7 +455,6 @@ def _build_html_table(papers: list[dict], color_map: dict[str, str]) -> str:
             f'<a class="paper-link" href="{url_esc}" target="_blank">🔗 Open</a>'
             if url else ""
         )
-
         detail = ""
         if rel_txt or qual_txt:
             detail = (
@@ -467,12 +463,10 @@ def _build_html_table(papers: list[dict], color_map: dict[str, str]) -> str:
                 f'<span class="detail-label">Quality:</span> {qual_txt}'
                 '</div>'
             )
-
         title_cell = (
             f"<details><summary>{title}</summary>{detail}</details>"
             if detail else title
         )
-
         rows.append(
             "<tr>"
             f'<td class="col-topic">{topic_cell}</td>'
@@ -485,16 +479,22 @@ def _build_html_table(papers: list[dict], color_map: dict[str, str]) -> str:
             "</tr>"
         )
 
+    # Plain-text headers with sort indicator (no links — sorting via buttons above)
+    def _th(label: str, css: str, key: str) -> str:
+        indicator = (" ▲" if sort_asc else " ▼") if sort_col == key else ""
+        active_style = "border-bottom:3px solid #4e8ef7;" if sort_col == key else ""
+        return f'<th class="{css}" style="{active_style}">{label}{indicator}</th>'
+
     header = (
         "<thead><tr>"
-        '<th class="col-topic">Topics</th>'
-        '<th class="col-title">Title <small>(click to expand)</small></th>'
-        '<th class="col-venue">Venue</th>'
-        '<th class="col-score">Rel</th>'
-        '<th class="col-score">Qual</th>'
-        '<th class="col-url">URL</th>'
-        '<th class="col-summary">Summary</th>'
-        "</tr></thead>"
+        + _th("Topics",  "col-topic",  "topic_key")
+        + _th("Title",   "col-title",  "title")
+        + _th("Venue",   "col-venue",  "venue")
+        + _th("Rel",     "col-score",  "relevance_score")
+        + _th("Qual",    "col-score",  "quality_score")
+        + '<th class="col-url">URL</th>'
+        + '<th class="col-summary">Summary</th>'
+        + "</tr></thead>"
     )
     return (
         f'<table class="arxiv-table">{header}'
@@ -515,6 +515,8 @@ def main() -> None:
         ("results",     None),
         ("all_papers",  []),
         ("source_name", ""),
+        ("sort_col",    "quality_score"),
+        ("sort_asc",    False),
     ]:
         st.session_state.setdefault(key, val)
 
@@ -727,37 +729,57 @@ def main() -> None:
             st.info("No papers match the current filters.")
             return
 
-        # ── Sort controls ─────────────────────────────────────────────────────
-        # Each entry: primary_key, secondary_key, ascending
-        _SORT_OPTIONS = {
-            "Quality (high → low)":   ("quality_score",   "relevance_score", False),
-            "Relevance (high → low)": ("relevance_score", "quality_score",   False),
-            "Quality (low → high)":   ("quality_score",   "relevance_score", True),
-            "Relevance (low → high)": ("relevance_score", "quality_score",   True),
-            "Topic (A → Z)":          ("topic_key",       "title",           True),
-            "Topic (Z → A)":          ("topic_key",       "title",           False),
-            "Title (A → Z)":          ("title",           "topic_key",       True),
-            "Title (Z → A)":          ("title",           "topic_key",       False),
-            "Venue (A → Z)":          ("venue",           "title",           True),
+        # ── Sort buttons ──────────────────────────────────────────────────────
+        _SORT_COLS = [
+            ("Topics", "topic_key",       True),
+            ("Title",  "title",           True),
+            ("Venue",  "venue",           True),
+            ("Rel",    "relevance_score", False),
+            ("Qual",   "quality_score",   False),
+        ]
+        st.caption("Sort by:")
+        sort_btns = st.columns(len(_SORT_COLS))
+        for (label, key, default_asc), col in zip(_SORT_COLS, sort_btns):
+            active = st.session_state.sort_col == key
+            indicator = (" ▲" if st.session_state.sort_asc else " ▼") if active else ""
+            with col:
+                if st.button(
+                    f"{label}{indicator}",
+                    key=f"sort_{key}",
+                    use_container_width=True,
+                    type="primary" if active else "secondary",
+                ):
+                    if active:
+                        st.session_state.sort_asc = not st.session_state.sort_asc
+                    else:
+                        st.session_state.sort_col = key
+                        st.session_state.sort_asc = default_asc
+                    st.rerun()
+
+        # Sort papers
+        _secondary = {
+            "quality_score":   "relevance_score",
+            "relevance_score": "quality_score",
+            "topic_key": "title", "title": "topic_key", "venue": "title",
         }
-        sort_label = st.selectbox(
-            "Sort by",
-            list(_SORT_OPTIONS.keys()),
-            label_visibility="collapsed",
-        )
-        sort_key, sort_key2, sort_asc = _SORT_OPTIONS[sort_label]
+        sc  = st.session_state.sort_col
+        sc2 = _secondary[sc]
+        asc = st.session_state.sort_asc
 
         def _sort_key(p: dict):
             def val(k):
                 if k == "topic_key":
                     return ", ".join(sorted(p.get("topics", [p.get("topic_key", "")])))
                 return (p.get(k) or 0) if k.endswith("_score") else (p.get(k) or "").lower()
-            return (val(sort_key), val(sort_key2))
+            return (val(sc), val(sc2))
 
-        papers_sorted = sorted(papers, key=_sort_key, reverse=not sort_asc)
+        papers_sorted = sorted(papers, key=_sort_key, reverse=not asc)
 
         # ── HTML table ────────────────────────────────────────────────────────
-        st.markdown(_build_html_table(papers_sorted, color_map), unsafe_allow_html=True)
+        st.markdown(
+            _build_html_table(papers_sorted, color_map, sc, asc),
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":
