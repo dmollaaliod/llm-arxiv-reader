@@ -546,7 +546,7 @@ def main() -> None:
             st.subheader("Filter")
             keyword = st.text_input("Search", placeholder="keyword…")
             st.divider()
-            if st.button("🔄 New Analysis", use_container_width=True):
+            if st.button("🔄 New Analysis", width="stretch"):
                 st.session_state.results     = None
                 st.session_state.all_papers  = []
                 st.session_state.source_name = ""
@@ -632,7 +632,7 @@ def main() -> None:
                         f"{len(loaded_results)} topic(s)"
                     )
                     if st.button("📊 Display Results", type="primary",
-                                 use_container_width=True):
+                                 width="stretch"):
                         st.session_state.results     = loaded_results
                         st.session_state.all_papers  = loaded_papers
                         st.session_state.source_name = loaded_source
@@ -649,7 +649,7 @@ def main() -> None:
                     "or load a saved JSON in the third tab.")
 
         if st.button("🔍 Analyse Digest", type="primary",
-                     disabled=not ready, use_container_width=True):
+                     disabled=not ready, width="stretch"):
             with st.status("Analysing digest…", expanded=True) as status:
                 results    = run_analysis(topics, digest_text)
                 all_papers = _flatten(results)
@@ -711,7 +711,7 @@ def main() -> None:
                     "Status": "Error" if r.get("error") else "OK",
                     "Error":  r.get("error", ""),
                 } for r in results]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "Key":   st.column_config.TextColumn(width="small"),
@@ -746,7 +746,7 @@ def main() -> None:
                 if st.button(
                     f"{label}{indicator}",
                     key=f"sort_{key}",
-                    use_container_width=True,
+                    width="stretch",
                     type="primary" if active else "secondary",
                 ):
                     if active:
