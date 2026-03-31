@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""ArXiv Digest Analyser — Textual graphical TUI."""
+"""ArXiv Digest Analyser — Streamlit web UI."""
 
 import asyncio
+import html as html_mod
 import json
+import math
+import random
 import re
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import anthropic
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, ScrollableContainer
-from textual.screen import ModalScreen, Screen
-from textual.widgets import (
-    Button, DataTable, DirectoryTree, Footer, Header,
-    Input, Label, ProgressBar, Select, Static,
-)
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 TOPICS_FILE = Path("topics.txt")
@@ -39,11 +35,20 @@ For each relevant paper provide:
   title    – exact title as it appears in the digest
   url      – ArXiv URL; if an arXiv ID (e.g. 2401.12345) is present construct
              https://arxiv.org/abs/<ID>; otherwise use any URL given in the digest
-  summary  – 2-3 sentences summarising what the paper does
-  relevance– 2-3 sentences explaining why it is relevant to the given topic
-  quality  – 2-3 sentences appraising the paper's methodology and contribution
-  venue    – conference/journal/workshop mentioned in the digest (not arXiv);
-             "Not specified" if absent
+  summary          – 2-3 sentences summarising what the paper does
+  relevance        – 2-3 sentences explaining why it is relevant to the given topic
+  relevance_score  – integer 1-5 rating of relevance (5 = directly and centrally relevant)
+  quality          – 2-3 sentences appraising the paper's methodology and contribution
+  quality_score    – integer 1-5 rating of apparent quality (5 = excellent, rigorous work)
+  venue            – conference/journal/workshop mentioned in the digest (not arXiv);
+                     "Not specified" if absent
+
+Scoring guide:
+  5 – outstanding / directly central
+  4 – strong / clearly relevant
+  3 – moderate / tangentially relevant
+  2 – weak / limited relevance or quality
+  1 – minimal
 
 JSON schema (no other text):
 {
@@ -54,7 +59,9 @@ JSON schema (no other text):
       "url": "...",
       "summary": "...",
       "relevance": "...",
+      "relevance_score": <1-5>,
       "quality": "...",
+      "quality_score": <1-5>,
       "venue": "..."
     }
   ]
@@ -72,82 +79,158 @@ _DIGEST_WRAPPER = """\
 _TOPIC_REQUEST = """\
 Identify all papers from the digest above that are relevant to this topic:
 
-**{topic}**
+**{query}**
 
 Return only the JSON object.
 """
 
-# ── Data helpers ───────────────────────────────────────────────────────────────
-def get_topics() -> "list[str] | str":
-    if not TOPICS_FILE.exists():
-        return f"topics.txt not found"
-    ts = [l.strip() for l in TOPICS_FILE.read_text("utf-8").splitlines() if l.strip()]
-    return ts if ts else "topics.txt is empty"
+# ── Topics parsing ─────────────────────────────────────────────────────────────
+# Each topic is a dict: {"key": str, "query": str}
+# topics.txt lines are either:
+#   - plain string  →  key = query = that string
+#   - JSON {"key": "...", "query": "..."}  →  key for display, query sent to LLM
 
-
-def get_digest(path: str) -> "tuple[str | None, str | None]":
-    p = Path(path)
-    if not p.exists():
-        return None, f"File not found: {path}"
+def _parse_topic_line(line: str) -> "dict | None":
+    line = line.strip()
+    if not line:
+        return None
     try:
-        return p.read_text("utf-8"), None
-    except Exception as exc:
-        return None, str(exc)
+        data = json.loads(line)
+        if isinstance(data, dict) and "query" in data:
+            return {"key": data.get("key", data["query"]), "query": data["query"]}
+    except json.JSONDecodeError:
+        pass
+    return {"key": line, "query": line}
 
 
+def get_topics() -> "list[dict] | str":
+    if not TOPICS_FILE.exists():
+        return "topics.txt not found"
+    topics = [
+        t for t in (_parse_topic_line(l)
+                    for l in TOPICS_FILE.read_text("utf-8").splitlines())
+        if t is not None
+    ]
+    return topics if topics else "topics.txt is empty"
+
+
+# ── Agent ──────────────────────────────────────────────────────────────────────
 def _extract_json(text: str) -> dict:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     return json.loads(m.group() if m else text)
 
 
+MAX_RETRIES = 4          # total attempts (1 original + 3 retries)
+BASE_DELAY  = 2.0       # seconds; doubles each attempt
+MAX_DELAY   = 60.0      # cap for rate-limit back-off
+
+
+def _backoff(attempt: int, extra: float = 0.0) -> float:
+    """Exponential back-off with jitter."""
+    delay = min(BASE_DELAY * math.pow(2, attempt), MAX_DELAY) + extra
+    return delay + random.uniform(0, delay * 0.2)   # ±20 % jitter
+
+
 async def _run_agent(
     client: anthropic.AsyncAnthropic,
-    topic: str,
+    topic: dict,          # {"key": ..., "query": ...}
     digest: str,
     sem: asyncio.Semaphore,
 ) -> dict:
+    last_error = ""
     async with sem:
-        try:
-            text = ""
-            async with client.messages.stream(
-                model=MODEL,
-                max_tokens=16000,
-                thinking={"type": "adaptive"},
-                system=SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _DIGEST_WRAPPER.format(digest=digest),
-                            "cache_control": {"type": "ephemeral"},
-                        },
-                        {
-                            "type": "text",
-                            "text": _TOPIC_REQUEST.format(topic=topic),
-                        },
-                    ],
-                }],
-            ) as stream:
-                async for chunk in stream.text_stream:
-                    text += chunk
-            result = _extract_json(text)
-            result.setdefault("papers", [])
-            result["topic"] = topic
-            return result
-        except Exception as exc:
-            return {"topic": topic, "papers": [], "error": str(exc)}
+        for attempt in range(MAX_RETRIES):
+            try:
+                text = ""
+                async with client.messages.stream(
+                    model=MODEL,
+                    max_tokens=16000,
+                    thinking={"type": "adaptive"},
+                    system=SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": _DIGEST_WRAPPER.format(digest=digest),
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                            {
+                                "type": "text",
+                                "text": _TOPIC_REQUEST.format(query=topic["query"]),
+                            },
+                        ],
+                    }],
+                ) as stream:
+                    async for chunk in stream.text_stream:
+                        text += chunk
+
+                result = _extract_json(text)   # raises json.JSONDecodeError on bad format
+                result.setdefault("papers", [])
+                result["topic_key"]   = topic["key"]
+                result["topic_query"] = topic["query"]
+                return result
+
+            except anthropic.RateLimitError as exc:
+                last_error = f"Rate limit: {exc}"
+                if attempt < MAX_RETRIES - 1:
+                    # honour Retry-After header when present, else use back-off
+                    retry_after = float(
+                        getattr(exc, "response", None) and
+                        exc.response.headers.get("retry-after", 0) or 0
+                    )
+                    await asyncio.sleep(_backoff(attempt, extra=retry_after))
+
+            except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+                last_error = f"API error: {exc}"
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_backoff(attempt))
+
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_error = f"Bad format: {exc}"
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_backoff(attempt))   # brief pause then retry
+
+        return {
+            "topic_key":   topic["key"],
+            "topic_query": topic["query"],
+            "papers":      [],
+            "error":       f"Failed after {MAX_RETRIES} attempts — {last_error}",
+        }
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _flatten(results: list[dict]) -> list[dict]:
     flat = []
     for r in results:
         for p in r.get("papers", []):
-            flat.append({**p, "topic": r["topic"]})
+            flat.append({**p, "topic_key": r["topic_key"],
+                              "topic_query": r.get("topic_query", r["topic_key"])})
     return flat
 
 
-def _save(all_papers: list[dict], results: list[dict], digest_path: str):
+def _deduplicate_papers(papers: list[dict]) -> list[dict]:
+    """Merge papers that appear under multiple topics into one row with a topics list."""
+    seen: dict[str, dict] = {}
+    order: list[str] = []
+    for p in papers:
+        key = (p.get("url") or "").strip() or (p.get("title") or "").strip().lower()
+        if not key:
+            continue
+        if key not in seen:
+            seen[key] = {**p, "topics": [p["topic_key"]]}
+            order.append(key)
+        else:
+            tk = p["topic_key"]
+            if tk not in seen[key]["topics"]:
+                seen[key]["topics"].append(tk)
+            for score_field in ("relevance_score", "quality_score"):
+                if (p.get(score_field) or 0) > (seen[key].get(score_field) or 0):
+                    seen[key][score_field] = p[score_field]
+    return [seen[k] for k in order]
+
+
+def _save(all_papers: list[dict], results: list[dict], source_name: str):
     OUTPUT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -155,7 +238,7 @@ def _save(all_papers: list[dict], results: list[dict], digest_path: str):
     jp.write_text(json.dumps({
         "metadata": {
             "timestamp": datetime.now().isoformat(),
-            "digest_file": digest_path,
+            "source": source_name,
             "model": MODEL,
             "total_papers": len(all_papers),
         },
@@ -167,12 +250,17 @@ def _save(all_papers: list[dict], results: list[dict], digest_path: str):
     lines = [
         "# ArXiv Digest Analysis",
         f"\n**Date:** {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"**Source:** {source_name}",
         f"**Model:** `{MODEL}`",
         f"**Total papers:** {len(all_papers)}",
         "\n---\n",
     ]
     for r in results:
-        lines.append(f"## {r['topic']}")
+        key   = r.get("topic_key", "")
+        query = r.get("topic_query", key)
+        lines.append(f"## {key}")
+        if query != key:
+            lines.append(f"*Query: {query}*\n")
         papers = r.get("papers", [])
         if not papers:
             lines.append("_No relevant papers found._\n")
@@ -192,380 +280,484 @@ def _save(all_papers: list[dict], results: list[dict], digest_path: str):
     return jp, mp
 
 
-# ── CSS ────────────────────────────────────────────────────────────────────────
-APP_CSS = """
-/* ── Shared ── */
-Screen { background: $background; }
+# ── JSON results loader ────────────────────────────────────────────────────────
+def _load_json(raw: str) -> "tuple[list, list, str] | str":
+    """Parse a saved results JSON.  Returns (results, all_papers, source) or an error string."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return f"Invalid JSON: {exc}"
 
-/* ── Welcome ── */
-WelcomeScreen          { align: center middle; }
-#welcome-box           { width: 70; height: auto; background: $surface;
-                         border: thick $primary; padding: 2 4; }
-#welcome-title         { text-align: center; color: $accent; text-style: bold;
-                         margin-bottom: 1; }
-#welcome-sub           { text-align: center; color: $text-muted;
-                         margin-bottom: 2; }
-#path-row              { height: 3; margin-bottom: 1; }
-#path-input            { width: 1fr; }
-#btn-browse            { width: auto; margin-left: 1; }
-#btn-analyse           { width: 100%; margin-top: 1; }
-#welcome-err           { color: red; height: 1; }
+    if not isinstance(data, dict):
+        return "Expected a JSON object at the top level."
 
-/* ── File browser ── */
-FileBrowserModal       { align: center middle; }
-FileBrowserModal > Container {
-    width: 72; height: 34; background: $surface;
-    border: thick $primary; padding: 1 2;
-}
-FileBrowserModal DirectoryTree { height: 1fr; }
-#fb-sel                { color: $text-muted; height: 1; margin-top: 1; }
-#fb-btns               { height: 3; align: right middle; }
+    results    = data.get("results_by_topic", [])
+    all_papers = data.get("all_papers", [])
+    source     = data.get("metadata", {}).get("source", "loaded file")
 
-/* ── Processing ── */
-ProcessingScreen       { align: center middle; }
-#proc-box              { width: 62; height: auto; background: $surface;
-                         border: thick $primary; padding: 2 4; }
-#proc-title            { text-align: center; color: $accent;
-                         text-style: bold; margin-bottom: 1; }
-ProgressBar            { margin: 1 0; }
-#proc-log              { height: 10; overflow-y: auto;
-                         border: solid $primary-darken-2;
-                         padding: 0 1; margin-top: 1; }
+    if not isinstance(results, list) or not isinstance(all_papers, list):
+        return "JSON does not match the expected results format."
 
-/* ── Results ── */
-ResultsScreen          { layout: vertical; }
-#toolbar               { height: 3; background: $boost;
-                         padding: 0 1; align: left middle; }
-#search                { width: 26; margin-right: 1; }
-#topic-sel             { width: 36; margin-right: 1; }
-#count                 { color: $text-muted; content-align: center middle;
-                         width: auto; }
-DataTable              { height: 1fr; }
+    # Back-compat: rebuild all_papers from results if the key is missing
+    if not all_papers and results:
+        all_papers = _flatten(results)
 
-/* ── Detail modal ── */
-PaperDetailModal       { align: center middle; }
-PaperDetailModal ScrollableContainer {
-    width: 94; max-height: 48; background: $surface;
-    border: thick $primary; padding: 1 2;
-}
-.dh                    { color: $accent; text-style: bold; margin-top: 1; }
-.durl                  { color: $primary; }
-.dvenue                { color: green; }
-#d-close               { margin-top: 1; align: center middle; }
-"""
+    # Normalise legacy field names (results saved before topic_key was added)
+    for p in all_papers:
+        if "topic_key" not in p:
+            p["topic_key"]   = p.get("topic", "")
+            p["topic_query"] = p.get("topic", "")
+    for r in results:
+        if "topic_key" not in r:
+            r["topic_key"]   = r.get("topic", "")
+            r["topic_query"] = r.get("topic", "")
 
-# ── File Browser Modal ─────────────────────────────────────────────────────────
-class FileBrowserModal(ModalScreen):
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._picked: "str | None" = None
-
-    def compose(self) -> ComposeResult:
-        with Container():
-            yield Label("[bold]Select ArXiv Digest File[/bold]", markup=True)
-            yield DirectoryTree(str(Path.cwd()))
-            yield Label("No file selected", id="fb-sel")
-            with Horizontal(id="fb-btns"):
-                yield Button("Select", id="fb-ok", variant="primary")
-                yield Button("Cancel", id="fb-cancel")
-
-    @on(DirectoryTree.FileSelected)
-    def on_file(self, e: DirectoryTree.FileSelected) -> None:
-        self._picked = str(e.path)
-        self.query_one("#fb-sel", Label).update(f"Selected: {Path(self._picked).name}")
-
-    @on(Button.Pressed, "#fb-ok")
-    def do_ok(self) -> None:
-        self.dismiss(self._picked)
-
-    @on(Button.Pressed, "#fb-cancel")
-    def do_cancel(self) -> None:
-        self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+    return results, all_papers, source
 
 
-# ── Paper Detail Modal ─────────────────────────────────────────────────────────
-class PaperDetailModal(ModalScreen):
-    BINDINGS = [Binding("escape", "dismiss", "Close")]
+# ── Analysis runner ────────────────────────────────────────────────────────────
+def run_analysis(topics: list[dict], digest: str) -> list[dict]:
+    progress_bar  = st.progress(0.0, text="Starting agents…")
+    log_container = st.empty()
+    log_lines: list[str] = []
+    done = 0
 
-    def __init__(self, paper: dict) -> None:
-        super().__init__()
-        self._p = paper
-
-    def compose(self) -> ComposeResult:
-        p = self._p
-        with ScrollableContainer():
-            yield Label(p.get("topic", ""), classes="dh")
-            yield Static(f"[bold]{p.get('title', '')}[/bold]", markup=True)
-            yield Static(p.get("url", ""), classes="durl")
-            yield Label("Venue", classes="dh")
-            yield Static(p.get("venue", "Not specified"), classes="dvenue")
-            yield Label("Summary", classes="dh")
-            yield Static(p.get("summary", ""))
-            yield Label("Relevance to Topic", classes="dh")
-            yield Static(p.get("relevance", ""))
-            yield Label("Quality Appraisal", classes="dh")
-            yield Static(p.get("quality", ""))
-            with Horizontal(id="d-close"):
-                yield Button("Close  [Esc]", id="d-close-btn", variant="primary")
-
-    @on(Button.Pressed, "#d-close-btn")
-    def close(self) -> None:
-        self.dismiss()
-
-
-# ── Welcome Screen ─────────────────────────────────────────────────────────────
-class WelcomeScreen(Screen):
-    def compose(self) -> ComposeResult:
-        with Container(id="welcome-box"):
-            yield Label("ArXiv Digest Analyser", id="welcome-title")
-            yield Label(
-                "Parallel LLM agents · one per topic · powered by Claude",
-                id="welcome-sub",
-            )
-            with Horizontal(id="path-row"):
-                yield Input(placeholder="Path to digest file…", id="path-input")
-                yield Button("Browse…", id="btn-browse")
-            yield Button("Analyse →", id="btn-analyse", variant="primary")
-            yield Label("", id="welcome-err")
-
-    @on(Button.Pressed, "#btn-browse")
-    def on_browse(self) -> None:
-        self.app.push_screen(FileBrowserModal(), self._got_path)
-
-    def _got_path(self, path: "str | None") -> None:
-        if path:
-            self.query_one("#path-input", Input).value = path
-
-    @on(Button.Pressed, "#btn-analyse")
-    def on_analyse(self) -> None:
-        self._try_start()
-
-    @on(Input.Submitted, "#path-input")
-    def on_submit(self, _: Input.Submitted) -> None:
-        self._try_start()
-
-    def _try_start(self) -> None:
-        path = self.query_one("#path-input", Input).value.strip()
-        err  = self.query_one("#welcome-err", Label)
-        if not path:
-            err.update("Please enter a file path.")
-            return
-        if not Path(path).exists():
-            err.update(f"File not found: {path}")
-            return
-        err.update("")
-        self.app.begin_analysis(path)  # type: ignore[attr-defined]
-
-
-# ── Processing Screen ──────────────────────────────────────────────────────────
-class ProcessingScreen(Screen):
-    def __init__(self, total: int) -> None:
-        super().__init__()
-        self._total = total
-        self._lines: list[str] = []
-
-    def compose(self) -> ComposeResult:
-        with Container(id="proc-box"):
-            yield Label("Analysing Digest…", id="proc-title")
-            yield Label(
-                f"Spawning {self._total} parallel agent(s)…", id="proc-status"
-            )
-            yield ProgressBar(total=self._total, show_eta=False, id="proc-bar")
-            with ScrollableContainer(id="proc-log"):
-                yield Static("", id="proc-text", markup=False)
-
-    def tick(self, done: int, topic: str) -> None:
-        self.query_one("#proc-bar", ProgressBar).update(progress=done)
-        self.query_one("#proc-status", Label).update(
-            f"Completed {done} / {self._total}…"
-        )
-        self._lines.append(f"✓ {topic}")
-        self.query_one("#proc-text", Static).update("\n".join(self._lines))
-        self.query_one("#proc-log", ScrollableContainer).scroll_end(animate=False)
-
-
-# ── Results Screen ─────────────────────────────────────────────────────────────
-_COL_FIELD = {
-    "Topic":   "topic",
-    "Title":   "title",
-    "Venue":   "venue",
-    "URL":     "url",
-    "Summary": "summary",
-}
-
-class ResultsScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back")]
-
-    def __init__(self, results: list[dict], digest_path: str) -> None:
-        super().__init__()
-        self._results     = results
-        self._digest_path = digest_path
-        self._all         = _flatten(results)
-        self._topics      = sorted({p["topic"] for p in self._all})
-        self._shown       = list(self._all)
-        self._sort_field  : "str | None" = None
-        self._sort_asc    = True
-
-    def compose(self) -> ComposeResult:
-        opts = [("All topics", "ALL")] + [(t, t) for t in self._topics]
-        yield Header()
-        with Horizontal(id="toolbar"):
-            yield Input(placeholder="🔍 Search…", id="search")
-            yield Select(options=opts, value="ALL", id="topic-sel")
-            yield Label("", id="count")
-        yield DataTable(id="table", zebra_stripes=True, cursor_type="row")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self._rebuild()
-        try:
-            jp, mp = _save(self._all, self._results, self._digest_path)
-            self.notify(f"Saved → {jp.name}  {mp.name}", timeout=6)
-        except Exception as exc:
-            self.notify(f"Save error: {exc}", severity="error")
-
-    # ── Build / refresh table ─────────────────────────────────────────────────
-    def _rebuild(self) -> None:
-        dt = self.query_one("#table", DataTable)
-        dt.clear(columns=True)
-        dt.add_columns("#", "Topic", "Title", "Venue", "URL", "Summary")
-        for i, p in enumerate(self._shown):
-            s = p.get("summary", "")
-            dt.add_row(
-                str(i + 1),
-                p.get("topic", ""),
-                p.get("title", ""),
-                p.get("venue", "Not specified"),
-                p.get("url", ""),
-                (s[:80] + "…") if len(s) > 80 else s,
-                key=str(i),
-            )
-        self.query_one("#count", Label).update(
-            f"{len(self._shown)} / {len(self._all)} papers"
-        )
-
-    def _refilter(self) -> None:
-        kw    = self.query_one("#search", Input).value.strip().lower()
-        sel   = self.query_one("#topic-sel", Select)
-        topic = str(sel.value) if sel.value is not Select.BLANK else "ALL"
-
-        papers = self._all
-        if topic != "ALL":
-            papers = [p for p in papers if p["topic"] == topic]
-        if kw:
-            papers = [
-                p for p in papers
-                if any(
-                    kw in (p.get(f) or "").lower()
-                    for f in ("title", "summary", "topic", "venue",
-                              "relevance", "quality", "url")
-                )
-            ]
-        if self._sort_field:
-            papers = sorted(
-                papers,
-                key=lambda p: (p.get(self._sort_field) or "").lower(),
-                reverse=not self._sort_asc,
-            )
-        self._shown = papers
-        self._rebuild()
-
-    # ── Events ────────────────────────────────────────────────────────────────
-    @on(Input.Changed,  "#search")
-    def on_search(self, _: Input.Changed) -> None:
-        self._refilter()
-
-    @on(Select.Changed, "#topic-sel")
-    def on_topic(self, _: Select.Changed) -> None:
-        self._refilter()
-
-    @on(DataTable.HeaderSelected)
-    def on_header(self, event: DataTable.HeaderSelected) -> None:
-        field = _COL_FIELD.get(str(event.label).strip())
-        if not field:
-            return
-        if self._sort_field == field:
-            self._sort_asc = not self._sort_asc
-        else:
-            self._sort_field, self._sort_asc = field, True
-        self._refilter()
-        arrow = "↑" if self._sort_asc else "↓"
-        self.notify(f"Sorted by {event.label} {arrow}", timeout=2)
-
-    @on(DataTable.RowSelected)
-    def on_row(self, event: DataTable.RowSelected) -> None:
-        try:
-            paper = self._shown[int(str(event.row_key.value))]
-            self.app.push_screen(PaperDetailModal(paper))
-        except (ValueError, IndexError):
-            pass
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-
-# ── Application ────────────────────────────────────────────────────────────────
-class ArxivAnalyzerApp(App):
-    CSS      = APP_CSS
-    TITLE    = "ArXiv Digest Analyser"
-    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
-
-    def on_mount(self) -> None:
-        self.push_screen(WelcomeScreen())
-
-    # called from WelcomeScreen
-    def begin_analysis(self, digest_path: str) -> None:
-        topics_or_err = get_topics()
-        if isinstance(topics_or_err, str):
-            self.notify(topics_or_err, severity="error")
-            return
-        topics: list[str] = topics_or_err
-        self._proc = ProcessingScreen(len(topics))
-        self.push_screen(self._proc)
-        self._run(digest_path, topics)
-
-    @work(exclusive=True)
-    async def _run(self, digest_path: str, topics: list[str]) -> None:
-        digest, err = get_digest(digest_path)
-        if err:
-            self.notify(err, severity="error")
-            self.pop_screen()
-            return
-
+    async def _all():
+        nonlocal done
         client = anthropic.AsyncAnthropic()
         sem    = asyncio.Semaphore(8)
-        done   = 0
         lock   = asyncio.Lock()
 
-        async def one(topic: str) -> dict:
+        async def one(topic: dict) -> dict:
             nonlocal done
             result = await _run_agent(client, topic, digest, sem)
             async with lock:
                 done += 1
                 n = done
-            self._proc.tick(n, topic)
+            pct = n / len(topics)
+            progress_bar.progress(
+                pct, text=f"({n}/{len(topics)})  ✓ {topic['key']}"
+            )
+            log_lines.append(f"✓ {topic['key']}")
+            log_container.code("\n".join(log_lines))
             return result
 
-        raw = await asyncio.gather(*[one(t) for t in topics],
-                                   return_exceptions=True)
-        results = [
-            r if not isinstance(r, Exception)
-            else {"topic": topics[i], "papers": [], "error": str(r)}
-            for i, r in enumerate(raw)
-        ]
+        return await asyncio.gather(*[one(t) for t in topics],
+                                    return_exceptions=True)
 
-        self.pop_screen()                                   # remove ProcessingScreen
-        self.push_screen(ResultsScreen(results, digest_path))
+    raw = asyncio.run(_all())
+    progress_bar.empty()
+    log_container.empty()
+
+    return [
+        r if not isinstance(r, Exception)
+        else {"topic_key": topics[i]["key"], "topic_query": topics[i]["query"],
+              "papers": [], "error": str(r)}
+        for i, r in enumerate(raw)
+    ]
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Streamlit UI ───────────────────────────────────────────────────────────────
+_TABLE_CSS = """
+<style>
+table.arxiv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88em;
+    font-family: inherit;
+}
+table.arxiv-table th {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 2px solid rgba(128,128,128,0.4);
+    white-space: nowrap;
+    background: rgba(128,128,128,0.08);
+}
+table.arxiv-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(128,128,128,0.15);
+    vertical-align: top;
+    white-space: normal;
+    word-break: break-word;
+}
+table.arxiv-table tr:hover td { background: rgba(128,128,128,0.05); }
+.col-topic   { width:  9%; min-width: 80px; }
+.col-title   { width: 22%; min-width: 140px; }
+.col-venue   { width:  9%; min-width: 80px; }
+.col-score   { width:  5%; min-width: 55px; text-align: center; }
+.col-url     { width:  6%; min-width: 60px; }
+.col-summary { width: 49%; }
+details > summary { cursor: pointer; font-weight: 600; list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▶ "; font-size: 0.75em; opacity: 0.6; }
+details[open] > summary::before { content: "▼ "; }
+details[open] > summary { margin-bottom: 6px; }
+.detail-section { margin-top: 8px; font-size: 0.9em; opacity: 0.85; }
+.detail-label { font-weight: 600; }
+.score-pip { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:2px; }
+.pip-filled { background: #4CAF50; }
+.pip-empty  { background: rgba(128,128,128,0.2); }
+a.paper-link { color: #4e8ef7; text-decoration: none; }
+a.paper-link:hover { text-decoration: underline; }
+</style>
+"""
+
+
+# 20 visually distinct colours (Matplotlib tab20)
+_TOPIC_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+    "#c49c94", "#f7b6d2", "#c7c7c7", "#dbdb8d", "#9edae5",
+]
+
+
+def _topic_color_map(all_keys: list[str]) -> dict[str, str]:
+    """Assign a stable colour to each topic key."""
+    return {
+        key: _TOPIC_PALETTE[i % len(_TOPIC_PALETTE)]
+        for i, key in enumerate(sorted(all_keys))
+    }
+
+
+def _topic_badge(label: str, color: str) -> str:
+    return (
+        f'<span style="background:{color};color:#fff;padding:2px 7px;'
+        f'border-radius:10px;font-size:0.8em;white-space:nowrap;'
+        f'display:inline-block;margin:2px 0;">'
+        f'{html_mod.escape(label)}</span>'
+    )
+
+
+def _score_pips(score: int, max_score: int = 5) -> str:
+    pips = [
+        f'<span class="score-pip {"pip-filled" if i <= score else "pip-empty"}"></span>'
+        for i in range(1, max_score + 1)
+    ]
+    return f'{"".join(pips)} <small>{score}</small>'
+
+
+def _build_html_table(papers: list[dict], color_map: dict[str, str]) -> str:
+    rows = []
+    for p in papers:
+        title      = html_mod.escape(p.get("title", ""))
+        topics     = p.get("topics", [p.get("topic_key", "")])
+        topic_cell = "<br>".join(
+            _topic_badge(t, color_map.get(t, "#888")) for t in topics
+        )
+        venue      = html_mod.escape(p.get("venue", "Not specified"))
+        summary    = html_mod.escape(p.get("summary", ""))
+        rel_txt    = html_mod.escape(p.get("relevance", ""))
+        qual_txt   = html_mod.escape(p.get("quality", ""))
+        url        = p.get("url", "")
+        url_esc    = html_mod.escape(url)
+        rel_score  = int(p.get("relevance_score") or 0)
+        qual_score = int(p.get("quality_score")   or 0)
+
+        url_cell = (
+            f'<a class="paper-link" href="{url_esc}" target="_blank">🔗 Open</a>'
+            if url else ""
+        )
+
+        detail = ""
+        if rel_txt or qual_txt:
+            detail = (
+                '<div class="detail-section">'
+                f'<span class="detail-label">Relevance:</span> {rel_txt}<br><br>'
+                f'<span class="detail-label">Quality:</span> {qual_txt}'
+                '</div>'
+            )
+
+        title_cell = (
+            f"<details><summary>{title}</summary>{detail}</details>"
+            if detail else title
+        )
+
+        rows.append(
+            "<tr>"
+            f'<td class="col-topic">{topic_cell}</td>'
+            f'<td class="col-title">{title_cell}</td>'
+            f'<td class="col-venue">{venue}</td>'
+            f'<td class="col-score">{_score_pips(rel_score)}</td>'
+            f'<td class="col-score">{_score_pips(qual_score)}</td>'
+            f'<td class="col-url">{url_cell}</td>'
+            f'<td class="col-summary">{summary}</td>'
+            "</tr>"
+        )
+
+    header = (
+        "<thead><tr>"
+        '<th class="col-topic">Topics</th>'
+        '<th class="col-title">Title <small>(click to expand)</small></th>'
+        '<th class="col-venue">Venue</th>'
+        '<th class="col-score">Rel</th>'
+        '<th class="col-score">Qual</th>'
+        '<th class="col-url">URL</th>'
+        '<th class="col-summary">Summary</th>'
+        "</tr></thead>"
+    )
+    return (
+        f'<table class="arxiv-table">{header}'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
 def main() -> None:
-    ArxivAnalyzerApp().run()
+    st.set_page_config(
+        page_title="ArXiv Digest Analyser",
+        page_icon="📄",
+        layout="wide",
+    )
+    st.markdown(_TABLE_CSS, unsafe_allow_html=True)
+
+    # Session state defaults
+    for key, val in [
+        ("results",     None),
+        ("all_papers",  []),
+        ("source_name", ""),
+    ]:
+        st.session_state.setdefault(key, val)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.title("📄 ArXiv Digest Analyser")
+        st.caption("Parallel LLM agents · one per topic · powered by Claude")
+        st.divider()
+
+        topics_or_err = get_topics()
+        if isinstance(topics_or_err, str):
+            st.error(topics_or_err)
+            topics: list[dict] = []
+        else:
+            topics = topics_or_err
+            st.subheader(f"Topics ({len(topics)})")
+            for t in topics:
+                if t["key"] != t["query"]:
+                    st.markdown(f"**{t['key']}**  \n{t['query']}")
+                else:
+                    st.markdown(f"- {t['key']}")
+
+        # Filters (shown only when results exist)
+        keyword = ""
+        if st.session_state.results is not None:
+            st.divider()
+            st.subheader("Filter")
+            keyword = st.text_input("Search", placeholder="keyword…")
+            st.divider()
+            if st.button("🔄 New Analysis", use_container_width=True):
+                st.session_state.results     = None
+                st.session_state.all_papers  = []
+                st.session_state.source_name = ""
+                st.rerun()
+
+    # ── Main area ─────────────────────────────────────────────────────────────
+    if st.session_state.results is None:
+
+        st.header("Load Digest or Results")
+        tab_upload, tab_path, tab_json = st.tabs([
+            "📂 Browse & Upload",
+            "⌨️  Enter File Path",
+            "📊 Load JSON Results",
+        ])
+
+        digest_text  = None
+        source_label = None
+
+        with tab_upload:
+            uploaded = st.file_uploader(
+                "Select your ArXiv digest file",
+                type=["txt", "md", "html", "csv"],
+                label_visibility="collapsed",
+            )
+            if uploaded:
+                digest_text  = uploaded.read().decode("utf-8", errors="replace")
+                source_label = uploaded.name
+
+        with tab_path:
+            path_input = st.text_input("File path", placeholder="/path/to/digest.txt")
+            if path_input:
+                p = Path(path_input.strip())
+                if p.exists():
+                    try:
+                        digest_text  = p.read_text("utf-8", errors="replace")
+                        source_label = path_input.strip()
+                        st.success(f"Loaded {p.name}  ({len(digest_text):,} chars)")
+                    except Exception as exc:
+                        st.error(str(exc))
+                else:
+                    st.error("File not found.")
+
+        with tab_json:
+            st.caption("Load a previously saved `arxiv_analysis_*.json` file "
+                       "to display its results without re-running any LLM agents.")
+            json_uploaded = st.file_uploader(
+                "Select a JSON results file",
+                type=["json"],
+                label_visibility="collapsed",
+                key="json_uploader",
+            )
+            json_path_input = st.text_input(
+                "Or enter file path",
+                placeholder="/path/to/arxiv_analysis_....json",
+                key="json_path",
+            )
+
+            json_raw = None
+            json_name = None
+            if json_uploaded:
+                json_raw  = json_uploaded.read().decode("utf-8", errors="replace")
+                json_name = json_uploaded.name
+            elif json_path_input:
+                jp = Path(json_path_input.strip())
+                if jp.exists():
+                    try:
+                        json_raw  = jp.read_text("utf-8")
+                        json_name = jp.name
+                    except Exception as exc:
+                        st.error(str(exc))
+                else:
+                    st.error("File not found.")
+
+            if json_raw:
+                outcome = _load_json(json_raw)
+                if isinstance(outcome, str):
+                    st.error(outcome)
+                else:
+                    loaded_results, loaded_papers, loaded_source = outcome
+                    st.success(
+                        f"✅ {json_name} — "
+                        f"{len(loaded_papers)} paper(s) across "
+                        f"{len(loaded_results)} topic(s)"
+                    )
+                    if st.button("📊 Display Results", type="primary",
+                                 use_container_width=True):
+                        st.session_state.results     = loaded_results
+                        st.session_state.all_papers  = loaded_papers
+                        st.session_state.source_name = loaded_source
+                        st.rerun()
+
+        # ── Analyse digest button (only relevant for the first two tabs) ───────
+        st.divider()
+
+        ready = bool(digest_text and topics)
+        if not topics:
+            st.warning("No topics loaded — check topics.txt.")
+        if not digest_text:
+            st.info("Upload or enter a digest file in the first two tabs above, "
+                    "or load a saved JSON in the third tab.")
+
+        if st.button("🔍 Analyse Digest", type="primary",
+                     disabled=not ready, use_container_width=True):
+            with st.status("Analysing digest…", expanded=True) as status:
+                results    = run_analysis(topics, digest_text)
+                all_papers = _flatten(results)
+                try:
+                    jp, _ = _save(all_papers, results, source_label)
+                    status.update(
+                        label=f"✅ Done — {len(all_papers)} paper(s) found. "
+                              f"Saved to `{jp.name}`.",
+                        state="complete",
+                    )
+                except Exception as exc:
+                    status.update(label=f"Done ({exc})", state="complete")
+
+            st.session_state.results     = results
+            st.session_state.all_papers  = all_papers
+            st.session_state.source_name = source_label
+            st.rerun()
+
+    else:
+        # ── Results view ──────────────────────────────────────────────────────
+        all_papers = st.session_state.all_papers
+        results    = st.session_state.results
+
+        # Deduplicate: papers appearing under multiple topics are merged into one row
+        deduped = _deduplicate_papers(all_papers)
+
+        # ── Inline topic filter ───────────────────────────────────────────────
+        all_keys = sorted({p["topic_key"] for p in all_papers})
+        selected_topics = st.multiselect(
+            "Filter by topic",
+            options=all_keys,
+            default=[],
+            placeholder="All topics",
+        )
+
+        color_map = _topic_color_map(all_keys)
+
+        # Apply filters
+        papers = deduped
+        if selected_topics:
+            papers = [p for p in papers
+                      if any(t in selected_topics for t in p.get("topics", []))]
+        if keyword:
+            kw = keyword.lower()
+            papers = [
+                p for p in papers
+                if any(kw in (p.get(f) or "").lower()
+                       for f in ("title", "summary", "venue", "relevance", "quality"))
+                or any(kw in t.lower() for t in p.get("topics", []))
+            ]
+
+        # ── Topic summary ─────────────────────────────────────────────────────
+        with st.expander("Results by topic", expanded=False):
+            st.dataframe(
+                pd.DataFrame([{
+                    "Key":    r.get("topic_key", ""),
+                    "Query":  r.get("topic_query", ""),
+                    "Papers": len(r.get("papers", [])),
+                    "Status": "Error" if r.get("error") else "OK",
+                    "Error":  r.get("error", ""),
+                } for r in results]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Key":   st.column_config.TextColumn(width="small"),
+                    "Query": st.column_config.TextColumn(width="large"),
+                    "Error": st.column_config.TextColumn(width="large"),
+                },
+            )
+
+        st.caption(
+            f"Source: **{st.session_state.source_name}** · "
+            f"Showing **{len(papers)}** / {len(all_papers)} papers"
+        )
+
+        if not papers:
+            st.info("No papers match the current filters.")
+            return
+
+        # ── Sort controls ─────────────────────────────────────────────────────
+        # Each entry: primary_key, secondary_key, ascending
+        _SORT_OPTIONS = {
+            "Quality (high → low)":   ("quality_score",   "relevance_score", False),
+            "Relevance (high → low)": ("relevance_score", "quality_score",   False),
+            "Quality (low → high)":   ("quality_score",   "relevance_score", True),
+            "Relevance (low → high)": ("relevance_score", "quality_score",   True),
+            "Topic (A → Z)":          ("topic_key",       "title",           True),
+            "Topic (Z → A)":          ("topic_key",       "title",           False),
+            "Title (A → Z)":          ("title",           "topic_key",       True),
+            "Title (Z → A)":          ("title",           "topic_key",       False),
+            "Venue (A → Z)":          ("venue",           "title",           True),
+        }
+        sort_label = st.selectbox(
+            "Sort by",
+            list(_SORT_OPTIONS.keys()),
+            label_visibility="collapsed",
+        )
+        sort_key, sort_key2, sort_asc = _SORT_OPTIONS[sort_label]
+
+        def _sort_key(p: dict):
+            def val(k):
+                if k == "topic_key":
+                    return ", ".join(sorted(p.get("topics", [p.get("topic_key", "")])))
+                return (p.get(k) or 0) if k.endswith("_score") else (p.get(k) or "").lower()
+            return (val(sort_key), val(sort_key2))
+
+        papers_sorted = sorted(papers, key=_sort_key, reverse=not sort_asc)
+
+        # ── HTML table ────────────────────────────────────────────────────────
+        st.markdown(_build_html_table(papers_sorted, color_map), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

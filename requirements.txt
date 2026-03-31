@@ -1,4 +1,4 @@
 anthropic>=0.50.0
-rich>=13.0.0
+streamlit>=1.35.0
+pandas>=2.0.0
 python-dotenv
-textual>=0.80.0
