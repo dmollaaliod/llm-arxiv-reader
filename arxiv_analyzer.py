@@ -18,9 +18,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-TOPICS_FILE = Path("topics.txt")
-OUTPUT_DIR  = Path("output")
-MODEL       = "claude-opus-4-6"
+TOPICS_FILE   = Path("topics.txt")
+OUTPUT_DIR    = Path("output")
+#CLAUDE_MODEL  = "claude-opus-4-6"
+CLAUDE_MODEL  = "claude-sonnet-4-6"
+GEMINI_MODEL  = "gemini-2.5-flash"
+
+PROVIDERS = {
+    "Gemini": {"model": GEMINI_MODEL,  "key_env": "GOOGLE_API_KEY"},
+    "Claude": {"model": CLAUDE_MODEL,  "key_env": "ANTHROPIC_API_KEY"},
+}
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
@@ -131,7 +138,7 @@ def _backoff(attempt: int, extra: float = 0.0) -> float:
     return delay + random.uniform(0, delay * 0.2)   # ±20 % jitter
 
 
-async def _run_agent(
+async def _run_agent_claude(
     client: anthropic.AsyncAnthropic,
     topic: dict,          # {"key": ..., "query": ...}
     digest: str,
@@ -143,7 +150,7 @@ async def _run_agent(
             try:
                 text = ""
                 async with client.messages.stream(
-                    model=MODEL,
+                    model=CLAUDE_MODEL,
                     max_tokens=16000,
                     thinking={"type": "adaptive"},
                     system=SYSTEM_PROMPT,
@@ -199,6 +206,55 @@ async def _run_agent(
         }
 
 
+async def _run_agent_gemini(client, topic: dict, digest: str,
+                             sem: asyncio.Semaphore) -> dict:
+    from google.genai import types  # local import — only needed when Gemini is used
+    last_error = ""
+    prompt = (
+        _DIGEST_WRAPPER.format(digest=digest) + "\n" +
+        _TOPIC_REQUEST.format(query=topic["query"])
+    )
+    async with sem:
+        for attempt in range(MAX_RETRIES):
+            try:
+                text = ""
+                stream = await client.aio.models.generate_content_stream(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                    ),
+                )
+                async for chunk in stream:
+                    text += chunk.text or ""
+
+                result = _extract_json(text)
+                result.setdefault("papers", [])
+                result["topic_key"]   = topic["key"]
+                result["topic_query"] = topic["query"]
+                return result
+
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_error = f"Bad format: {exc}"
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_backoff(attempt))
+
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < MAX_RETRIES - 1:
+                    exc_lower = last_error.lower()
+                    extra = 30.0 if ("429" in exc_lower or "quota" in exc_lower
+                                     or "exhausted" in exc_lower) else 0.0
+                    await asyncio.sleep(_backoff(attempt, extra=extra))
+
+        return {
+            "topic_key":   topic["key"],
+            "topic_query": topic["query"],
+            "papers":      [],
+            "error":       f"Failed after {MAX_RETRIES} attempts — {last_error}",
+        }
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _flatten(results: list[dict]) -> list[dict]:
     flat = []
@@ -230,7 +286,8 @@ def _deduplicate_papers(papers: list[dict]) -> list[dict]:
     return [seen[k] for k in order]
 
 
-def _save(all_papers: list[dict], results: list[dict], source_name: str):
+def _save(all_papers: list[dict], results: list[dict], source_name: str,
+          model: str = GEMINI_MODEL):
     OUTPUT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -239,7 +296,7 @@ def _save(all_papers: list[dict], results: list[dict], source_name: str):
         "metadata": {
             "timestamp": datetime.now().isoformat(),
             "source": source_name,
-            "model": MODEL,
+            "model": model,
             "total_papers": len(all_papers),
         },
         "results_by_topic": results,
@@ -251,7 +308,7 @@ def _save(all_papers: list[dict], results: list[dict], source_name: str):
         "# ArXiv Digest Analysis",
         f"\n**Date:** {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"**Source:** {source_name}",
-        f"**Model:** `{MODEL}`",
+        f"**Model:** `{model}`",
         f"**Total papers:** {len(all_papers)}",
         "\n---\n",
     ]
@@ -316,7 +373,8 @@ def _load_json(raw: str) -> "tuple[list, list, str] | str":
 
 
 # ── Analysis runner ────────────────────────────────────────────────────────────
-def run_analysis(topics: list[dict], digest: str) -> list[dict]:
+def run_analysis(topics: list[dict], digest: str,
+                 provider: str = "Gemini") -> list[dict]:
     progress_bar  = st.progress(0.0, text="Starting agents…")
     log_container = st.empty()
     log_lines: list[str] = []
@@ -324,19 +382,25 @@ def run_analysis(topics: list[dict], digest: str) -> list[dict]:
 
     async def _all():
         nonlocal done
-        client = anthropic.AsyncAnthropic()
-        sem    = asyncio.Semaphore(8)
-        lock   = asyncio.Lock()
+        if provider == "Gemini":
+            from google import genai as google_genai
+            client    = google_genai.Client()
+            agent_fn  = _run_agent_gemini
+        else:
+            client    = anthropic.AsyncAnthropic()
+            agent_fn  = _run_agent_claude
+
+        sem  = asyncio.Semaphore(8)
+        lock = asyncio.Lock()
 
         async def one(topic: dict) -> dict:
             nonlocal done
-            result = await _run_agent(client, topic, digest, sem)
+            result = await agent_fn(client, topic, digest, sem)
             async with lock:
                 done += 1
                 n = done
-            pct = n / len(topics)
             progress_bar.progress(
-                pct, text=f"({n}/{len(topics)})  ✓ {topic['key']}"
+                n / len(topics), text=f"({n}/{len(topics)})  ✓ {topic['key']}"
             )
             log_lines.append(f"✓ {topic['key']}")
             log_container.code("\n".join(log_lines))
@@ -517,13 +581,33 @@ def main() -> None:
         ("source_name", ""),
         ("sort_col",    "quality_score"),
         ("sort_asc",    False),
+        ("provider",    "Gemini"),
     ]:
         st.session_state.setdefault(key, val)
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.title("📄 ArXiv Digest Analyser")
-        st.caption("Parallel LLM agents · one per topic · powered by Claude")
+        st.caption("Parallel LLM agents · one per topic")
+        st.divider()
+
+        # ── Provider selector ─────────────────────────────────────────────────
+        st.subheader("Provider")
+        provider = st.radio(
+            "Provider",
+            list(PROVIDERS.keys()),
+            index=list(PROVIDERS.keys()).index(st.session_state.provider),
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        st.session_state.provider = provider
+        model_name = PROVIDERS[provider]["model"]
+        key_env    = PROVIDERS[provider]["key_env"]
+        import os
+        if not os.environ.get(key_env):
+            st.warning(f"`{key_env}` not set in environment.")
+        else:
+            st.caption(f"Model: `{model_name}`")
         st.divider()
 
         topics_or_err = get_topics()
@@ -534,10 +618,7 @@ def main() -> None:
             topics = topics_or_err
             st.subheader(f"Topics ({len(topics)})")
             for t in topics:
-                if t["key"] != t["query"]:
-                    st.markdown(f"**{t['key']}**  \n{t['query']}")
-                else:
-                    st.markdown(f"- {t['key']}")
+                st.markdown(f"**{t['key']}**  \n{t['query']}")
 
         # Filters (shown only when results exist)
         keyword = ""
@@ -651,10 +732,11 @@ def main() -> None:
         if st.button("🔍 Analyse Digest", type="primary",
                      disabled=not ready, width="stretch"):
             with st.status("Analysing digest…", expanded=True) as status:
-                results    = run_analysis(topics, digest_text)
+                results    = run_analysis(topics, digest_text, provider)
                 all_papers = _flatten(results)
                 try:
-                    jp, _ = _save(all_papers, results, source_label)
+                    jp, _ = _save(all_papers, results, source_label,
+                                  model=PROVIDERS[provider]["model"])
                     status.update(
                         label=f"✅ Done — {len(all_papers)} paper(s) found. "
                               f"Saved to `{jp.name}`.",
