@@ -121,6 +121,15 @@ def get_topics() -> "list[dict] | str":
     return topics if topics else "topics.txt is empty"
 
 
+# ── Digest stats ───────────────────────────────────────────────────────────────
+def _parse_digest_stats(digest: str) -> dict:
+    """Count new submissions and replacements in an ArXiv digest."""
+    new_count  = sum(1 for line in digest.splitlines() if line.startswith("Date:"))
+    repl_count = sum(1 for line in digest.splitlines()
+                     if line.startswith("replaced with revised version"))
+    return {"new": new_count, "replaced": repl_count}
+
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 def _extract_json(text: str) -> dict:
     m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -311,28 +320,39 @@ def _deduplicate_papers(papers: list[dict]) -> list[dict]:
 
 
 def _save(all_papers: list[dict], results: list[dict], source_name: str,
-          model: str = GEMINI_MODEL):
+          model: str = GEMINI_MODEL,
+          digest_stats: "dict | None" = None):
     OUTPUT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    meta = {
+        "timestamp":    datetime.now().isoformat(),
+        "source":       source_name,
+        "model":        model,
+        "total_papers": len(all_papers),
+    }
+    if digest_stats:
+        meta["digest_new"]      = digest_stats["new"]
+        meta["digest_replaced"] = digest_stats["replaced"]
+
     jp = OUTPUT_DIR / f"arxiv_analysis_{ts}.json"
     jp.write_text(json.dumps({
-        "metadata": {
-            "timestamp": datetime.now().isoformat(),
-            "source": source_name,
-            "model": model,
-            "total_papers": len(all_papers),
-        },
+        "metadata":        meta,
         "results_by_topic": results,
-        "all_papers": all_papers,
+        "all_papers":       all_papers,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    digest_line = (
+        f"**Digest:** {digest_stats['new']} new · {digest_stats['replaced']} replaced"
+        if digest_stats else ""
+    )
     mp = OUTPUT_DIR / f"arxiv_analysis_{ts}.md"
     lines = [
         "# ArXiv Digest Analysis",
         f"\n**Date:** {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"**Source:** {source_name}",
         f"**Model:** `{model}`",
+        *([ digest_line ] if digest_line else []),
         f"**Total papers:** {len(all_papers)}",
         "\n---\n",
     ]
@@ -372,9 +392,14 @@ def _load_json(raw: str) -> "tuple[list, list, str] | str":
     if not isinstance(data, dict):
         return "Expected a JSON object at the top level."
 
+    meta       = data.get("metadata", {})
     results    = data.get("results_by_topic", [])
     all_papers = data.get("all_papers", [])
-    source     = data.get("metadata", {}).get("source", "loaded file")
+    source     = meta.get("source", "loaded file")
+    digest_stats = (
+        {"new": meta["digest_new"], "replaced": meta["digest_replaced"]}
+        if "digest_new" in meta else None
+    )
 
     if not isinstance(results, list) or not isinstance(all_papers, list):
         return "JSON does not match the expected results format."
@@ -393,7 +418,7 @@ def _load_json(raw: str) -> "tuple[list, list, str] | str":
             r["topic_key"]   = r.get("topic", "")
             r["topic_query"] = r.get("topic", "")
 
-    return results, all_papers, source
+    return results, all_papers, source, digest_stats
 
 
 # ── Analysis runner ────────────────────────────────────────────────────────────
@@ -721,6 +746,9 @@ def main() -> None:
             if uploaded:
                 digest_text  = uploaded.read().decode("utf-8", errors="replace")
                 source_label = uploaded.name
+                stats = _parse_digest_stats(digest_text)
+                st.info(f"📄 **{stats['new']}** new submissions · "
+                        f"**{stats['replaced']}** replacements")
 
         with tab_path:
             path_input = st.text_input("File path", placeholder="/path/to/digest.txt")
@@ -730,7 +758,10 @@ def main() -> None:
                     try:
                         digest_text  = p.read_text("utf-8", errors="replace")
                         source_label = path_input.strip()
-                        st.success(f"Loaded {p.name}  ({len(digest_text):,} chars)")
+                        stats = _parse_digest_stats(digest_text)
+                        st.success(f"Loaded {p.name}  ({len(digest_text):,} chars) · "
+                                   f"**{stats['new']}** new · "
+                                   f"**{stats['replaced']}** replaced")
                     except Exception as exc:
                         st.error(str(exc))
                 else:
@@ -772,11 +803,15 @@ def main() -> None:
                 if isinstance(outcome, str):
                     st.error(outcome)
                 else:
-                    loaded_results, loaded_papers, loaded_source = outcome
+                    loaded_results, loaded_papers, loaded_source, loaded_stats = outcome
+                    stats_str = (
+                        f" · {loaded_stats['new']} new · {loaded_stats['replaced']} replaced"
+                        if loaded_stats else ""
+                    )
                     st.success(
                         f"✅ {json_name} — "
                         f"{len(loaded_papers)} paper(s) across "
-                        f"{len(loaded_results)} topic(s)"
+                        f"{len(loaded_results)} topic(s){stats_str}"
                     )
                     if st.button("📊 Display Results", type="primary",
                                  width="stretch"):
@@ -802,7 +837,8 @@ def main() -> None:
                 all_papers = _flatten(results)
                 try:
                     jp, _ = _save(all_papers, results, source_label,
-                                  model=PROVIDERS[provider]["model"])
+                                  model=PROVIDERS[provider]["model"],
+                                  digest_stats=_parse_digest_stats(digest_text))
                     status.update(
                         label=f"✅ Done — {len(all_papers)} paper(s) found. "
                               f"Saved to `{jp.name}`.",
@@ -870,7 +906,7 @@ def main() -> None:
 
         st.caption(
             f"Source: **{st.session_state.source_name}** · "
-            f"Showing **{len(papers)}** / {len(all_papers)} papers"
+            f"Showing **{len(papers)}** / {len(deduped)} papers"
         )
 
         if not papers:
