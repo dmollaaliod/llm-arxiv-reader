@@ -39,9 +39,9 @@ Rules:
 - Return ONLY the JSON object — no preamble, no trailing commentary.
 
 For each relevant paper provide:
-  title    – exact title as it appears in the digest
-  url      – ArXiv URL; if an arXiv ID (e.g. 2401.12345) is present construct
-             https://arxiv.org/abs/<ID>; otherwise use any URL given in the digest
+  title            – exact title as it appears in the digest
+  url              – ArXiv URL; if an arXiv ID (e.g. 2401.12345) is present construct
+                     https://arxiv.org/abs/<ID>; otherwise use any URL given in the digest
   summary          – 2-3 sentences summarising what the paper does
   relevance        – 2-3 sentences explaining why it is relevant to the given topic
   relevance_score  – integer 1-5 rating of relevance (5 = directly and centrally relevant)
@@ -123,11 +123,64 @@ def get_topics() -> "list[dict] | str":
 
 # ── Digest stats ───────────────────────────────────────────────────────────────
 def _parse_digest_stats(digest: str) -> dict:
-    """Count new submissions and replacements in an ArXiv digest."""
-    new_count  = sum(1 for line in digest.splitlines() if line.startswith("Date:"))
-    repl_count = sum(1 for line in digest.splitlines()
-                     if line.startswith("replaced with revised version"))
-    return {"new": new_count, "replaced": repl_count}
+    """Count new submissions, cross-listings, and revisions in an ArXiv digest."""
+    lines        = digest.splitlines()
+    cross_count  = sum(1 for l in lines if "(*cross-listing*)" in l)
+    date_count   = sum(1 for l in lines if l.startswith("Date:"))
+    repl_count   = sum(1 for l in lines if l.startswith("replaced with revised version"))
+    # cross-listings also carry a Date: line, so subtract them
+    new_count    = max(0, date_count - cross_count)
+    return {"new": new_count, "cross_listing": cross_count, "replaced": repl_count}
+
+
+def _parse_paper_types(digest: str) -> dict[str, str]:
+    """Return {arxiv_id: paper_type} for every entry in the digest.
+
+    Scans line-by-line: an `arXiv:XXXXXX` line sets the current ID (and
+    whether it is a cross-listing); the next non-blank line determines the
+    type ("Date:" → new/cross-listing, "replaced with…" → revised).
+    """
+    mapping: dict[str, str] = {}
+    lines = digest.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r'arXiv:(\d+\.\d+)', line)
+        if m:
+            arxiv_id = m.group(1)
+            is_cross = "(*cross-listing*)" in line
+            # Look ahead (up to 4 lines) for the type marker
+            paper_type = "new"
+            for j in range(i + 1, min(i + 5, len(lines))):
+                nl = lines[j].strip()
+                if not nl:
+                    continue
+                if nl.startswith("Date:"):
+                    paper_type = "cross-listing" if is_cross else "new"
+                    break
+                if nl.startswith("replaced with revised version"):
+                    paper_type = "revised"
+                    break
+            mapping[arxiv_id] = paper_type
+        i += 1
+    return mapping
+
+
+def _annotate_paper_types(results: list[dict], type_map: dict[str, str]) -> None:
+    """Attach paper_type to every paper in results using the pre-built type_map.
+
+    Extracts the arXiv ID from the paper URL (strips version suffix, e.g. v2),
+    looks it up in type_map, and sets paper["paper_type"]. Defaults to "new"
+    when the ID is not found (e.g. non-arXiv papers).
+    """
+    _id_re = re.compile(r'arxiv\.org/abs/(\d+\.\d+)', re.IGNORECASE)
+    for r in results:
+        for p in r.get("papers", []):
+            url = p.get("url", "")
+            m = _id_re.search(url)
+            # strip version suffix (e.g. 2603.12345v2 → 2603.12345)
+            arxiv_id = re.sub(r'v\d+$', '', m.group(1)) if m else None
+            p["paper_type"] = type_map.get(arxiv_id, "new") if arxiv_id else "new"
 
 
 # ── Agent ──────────────────────────────────────────────────────────────────────
@@ -325,15 +378,23 @@ def _save(all_papers: list[dict], results: list[dict], source_name: str,
     OUTPUT_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    matched_new   = sum(1 for p in all_papers if p.get("paper_type", "new") == "new")
+    matched_cross = sum(1 for p in all_papers if p.get("paper_type") == "cross-listing")
+    matched_repl  = sum(1 for p in all_papers if p.get("paper_type") == "revised")
+
     meta = {
-        "timestamp":    datetime.now().isoformat(),
-        "source":       source_name,
-        "model":        model,
-        "total_papers": len(all_papers),
+        "timestamp":          datetime.now().isoformat(),
+        "source":             source_name,
+        "model":              model,
+        "total_papers":       len(all_papers),
+        "matched_new":        matched_new,
+        "matched_cross":      matched_cross,
+        "matched_replaced":   matched_repl,
     }
     if digest_stats:
-        meta["digest_new"]      = digest_stats["new"]
-        meta["digest_replaced"] = digest_stats["replaced"]
+        meta["digest_new"]          = digest_stats["new"]
+        meta["digest_cross_listing"] = digest_stats.get("cross_listing", 0)
+        meta["digest_replaced"]     = digest_stats["replaced"]
 
     jp = OUTPUT_DIR / f"arxiv_analysis_{ts}.json"
     jp.write_text(json.dumps({
@@ -343,7 +404,9 @@ def _save(all_papers: list[dict], results: list[dict], source_name: str,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
 
     digest_line = (
-        f"**Digest:** {digest_stats['new']} new · {digest_stats['replaced']} replaced"
+        f"**Digest:** {digest_stats['new']} new · "
+        f"{digest_stats.get('cross_listing', 0)} cross-listings · "
+        f"{digest_stats['replaced']} revised"
         if digest_stats else ""
     )
     mp = OUTPUT_DIR / f"arxiv_analysis_{ts}.md"
@@ -353,7 +416,7 @@ def _save(all_papers: list[dict], results: list[dict], source_name: str,
         f"**Source:** {source_name}",
         f"**Model:** `{model}`",
         *([ digest_line ] if digest_line else []),
-        f"**Total papers:** {len(all_papers)}",
+        f"**Total papers:** {len(all_papers)} ({matched_new} new · {matched_cross} cross-listings · {matched_repl} revised)",
         "\n---\n",
     ]
     for r in results:
@@ -397,7 +460,11 @@ def _load_json(raw: str) -> "tuple[list, list, str] | str":
     all_papers = data.get("all_papers", [])
     source     = meta.get("source", "loaded file")
     digest_stats = (
-        {"new": meta["digest_new"], "replaced": meta["digest_replaced"]}
+        {
+            "new":          meta["digest_new"],
+            "cross_listing": meta.get("digest_cross_listing", 0),
+            "replaced":     meta["digest_replaced"],
+        }
         if "digest_new" in meta else None
     )
 
@@ -413,6 +480,9 @@ def _load_json(raw: str) -> "tuple[list, list, str] | str":
         if "topic_key" not in p:
             p["topic_key"]   = p.get("topic", "")
             p["topic_query"] = p.get("topic", "")
+        # Back-compat: convert old boolean is_replacement to paper_type
+        if "paper_type" not in p and "is_replacement" in p:
+            p["paper_type"] = "revised" if p["is_replacement"] else "new"
     for r in results:
         if "topic_key" not in r:
             r["topic_key"]   = r.get("topic", "")
@@ -458,16 +528,20 @@ def run_analysis(topics: list[dict], digest: str,
         return await asyncio.gather(*[one(t) for t in topics],
                                     return_exceptions=True)
 
+    type_map = _parse_paper_types(digest)
+
     raw = asyncio.run(_all())
     progress_bar.empty()
     log_container.empty()
 
-    return [
+    results = [
         r if not isinstance(r, Exception)
         else {"topic_key": topics[i]["key"], "topic_query": topics[i]["query"],
               "papers": [], "error": str(r)}
         for i, r in enumerate(raw)
     ]
+    _annotate_paper_types(results, type_map)
+    return results
 
 
 # ── Streamlit UI ───────────────────────────────────────────────────────────────
@@ -506,6 +580,14 @@ details[open] > summary { margin-bottom: 6px; }
 .pip-empty  { background: rgba(128,128,128,0.2); }
 a.paper-link { color: #4e8ef7; text-decoration: none; }
 a.paper-link:hover { text-decoration: underline; }
+.badge-revised   { display:inline-block; padding:1px 5px; border-radius:3px;
+                   font-size:0.72em; font-weight:700; background:#e67e22;
+                   color:#fff; margin-left:5px; vertical-align:middle; letter-spacing:0.03em; }
+.badge-crosslist { display:inline-block; padding:1px 5px; border-radius:3px;
+                   font-size:0.72em; font-weight:700; background:#6c87c8;
+                   color:#fff; margin-left:5px; vertical-align:middle; letter-spacing:0.03em; }
+tr.row-revised   td { background: rgba(230,126,34,0.06); }
+tr.row-crosslist td { background: rgba(108,135,200,0.06); }
 </style>
 """
 
@@ -618,12 +700,22 @@ def _build_html_table(
             topic_sections.append(section)
 
         detail = "".join(topic_sections)
+        paper_type = p.get("paper_type", "new")
+        if paper_type == "revised":
+            type_badge = '<span class="badge-revised">REVISED</span>'
+            row_class  = ' class="row-revised"'
+        elif paper_type == "cross-listing":
+            type_badge = '<span class="badge-crosslist">CROSS-LIST</span>'
+            row_class  = ' class="row-crosslist"'
+        else:
+            type_badge = ""
+            row_class  = ""
         title_cell = (
-            f"<details><summary>{title}</summary>{detail}</details>"
-            if detail else title
+            f"<details><summary>{title}{type_badge}</summary>{detail}</details>"
+            if detail else f"{title}{type_badge}"
         )
         rows.append(
-            "<tr>"
+            f"<tr{row_class}>"
             f'<td class="col-topic">{topic_cell}</td>'
             f'<td class="col-title">{title_cell}</td>'
             f'<td class="col-venue">{venue}</td>'
@@ -747,8 +839,9 @@ def main() -> None:
                 digest_text  = uploaded.read().decode("utf-8", errors="replace")
                 source_label = uploaded.name
                 stats = _parse_digest_stats(digest_text)
-                st.info(f"📄 **{stats['new']}** new submissions · "
-                        f"**{stats['replaced']}** replacements")
+                st.info(f"📄 **{stats['new']}** new · "
+                        f"**{stats['cross_listing']}** cross-listings · "
+                        f"**{stats['replaced']}** revised")
 
         with tab_path:
             path_input = st.text_input("File path", placeholder="/path/to/digest.txt")
@@ -761,7 +854,8 @@ def main() -> None:
                         stats = _parse_digest_stats(digest_text)
                         st.success(f"Loaded {p.name}  ({len(digest_text):,} chars) · "
                                    f"**{stats['new']}** new · "
-                                   f"**{stats['replaced']}** replaced")
+                                   f"**{stats['cross_listing']}** cross-listings · "
+                                   f"**{stats['replaced']}** revised")
                     except Exception as exc:
                         st.error(str(exc))
                 else:
@@ -805,7 +899,9 @@ def main() -> None:
                 else:
                     loaded_results, loaded_papers, loaded_source, loaded_stats = outcome
                     stats_str = (
-                        f" · {loaded_stats['new']} new · {loaded_stats['replaced']} replaced"
+                        f" · {loaded_stats['new']} new · "
+                        f"{loaded_stats.get('cross_listing', 0)} cross-listings · "
+                        f"{loaded_stats['replaced']} revised"
                         if loaded_stats else ""
                     )
                     st.success(
@@ -889,24 +985,39 @@ def main() -> None:
         with st.expander("Results by topic", expanded=False):
             st.dataframe(
                 pd.DataFrame([{
-                    "Key":    r.get("topic_key", ""),
-                    "Query":  r.get("topic_query", ""),
-                    "Papers": len(r.get("papers", [])),
-                    "Status": "Error" if r.get("error") else "OK",
-                    "Error":  r.get("error", ""),
+                    "Key":       r.get("topic_key", ""),
+                    "Query":     r.get("topic_query", ""),
+                    "Papers":    len(r.get("papers", [])),
+                    "New":       sum(1 for p in r.get("papers", []) if p.get("paper_type", "new") == "new"),
+                    "Cross-list": sum(1 for p in r.get("papers", []) if p.get("paper_type") == "cross-listing"),
+                    "Revised":   sum(1 for p in r.get("papers", []) if p.get("paper_type") == "revised"),
+                    "Status":    "Error" if r.get("error") else "OK",
+                    "Error":     r.get("error", ""),
                 } for r in results]),
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "Key":   st.column_config.TextColumn(width="small"),
-                    "Query": st.column_config.TextColumn(width="large"),
-                    "Error": st.column_config.TextColumn(width="large"),
+                    "Key":        st.column_config.TextColumn(width="small"),
+                    "Query":      st.column_config.TextColumn(width="large"),
+                    "New":        st.column_config.NumberColumn(width="small"),
+                    "Cross-list": st.column_config.NumberColumn(width="small"),
+                    "Revised":    st.column_config.NumberColumn(width="small"),
+                    "Error":      st.column_config.TextColumn(width="large"),
                 },
             )
 
+        shown_new   = sum(1 for p in papers if p.get("paper_type", "new") == "new")
+        shown_cross = sum(1 for p in papers if p.get("paper_type") == "cross-listing")
+        shown_repl  = sum(1 for p in papers if p.get("paper_type") == "revised")
+        type_parts  = [f"{shown_new} new"]
+        if shown_cross:
+            type_parts.append(f"{shown_cross} cross-list")
+        if shown_repl:
+            type_parts.append(f"{shown_repl} revised")
         st.caption(
             f"Source: **{st.session_state.source_name}** · "
-            f"Showing **{len(papers)}** / {len(deduped)} papers"
+            f"Showing **{len(papers)}** papers · "
+            + " · ".join(type_parts)
         )
 
         if not papers:
