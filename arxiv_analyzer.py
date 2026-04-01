@@ -266,23 +266,47 @@ def _flatten(results: list[dict]) -> list[dict]:
 
 
 def _deduplicate_papers(papers: list[dict]) -> list[dict]:
-    """Merge papers that appear under multiple topics into one row with a topics list."""
+    """Merge papers that appear under multiple topics into one row.
+
+    Adds:
+      topics                   – ordered list of topic keys
+      relevance_by_topic       – {topic_key: relevance_text}
+      quality_by_topic         – {topic_key: quality_text}
+      relevance_score_by_topic – {topic_key: int}
+      quality_score_by_topic   – {topic_key: int}
+    The top-level relevance_score / quality_score are kept as the maximum
+    (used as fallback sort key); display scores are averaged per selection.
+    """
     seen: dict[str, dict] = {}
     order: list[str] = []
     for p in papers:
         key = (p.get("url") or "").strip() or (p.get("title") or "").strip().lower()
         if not key:
             continue
+        tk = p["topic_key"]
+        rel_s  = int(p.get("relevance_score") or 0)
+        qual_s = int(p.get("quality_score")   or 0)
         if key not in seen:
-            seen[key] = {**p, "topics": [p["topic_key"]]}
+            seen[key] = {
+                **p,
+                "topics":                   [tk],
+                "relevance_by_topic":       {tk: p.get("relevance", "")},
+                "quality_by_topic":         {tk: p.get("quality",   "")},
+                "relevance_score_by_topic": {tk: rel_s},
+                "quality_score_by_topic":   {tk: qual_s},
+            }
             order.append(key)
         else:
-            tk = p["topic_key"]
             if tk not in seen[key]["topics"]:
                 seen[key]["topics"].append(tk)
-            for score_field in ("relevance_score", "quality_score"):
-                if (p.get(score_field) or 0) > (seen[key].get(score_field) or 0):
-                    seen[key][score_field] = p[score_field]
+            seen[key]["relevance_by_topic"][tk]       = p.get("relevance", "")
+            seen[key]["quality_by_topic"][tk]         = p.get("quality",   "")
+            seen[key]["relevance_score_by_topic"][tk] = rel_s
+            seen[key]["quality_score_by_topic"][tk]   = qual_s
+            # keep max as the canonical score (used for sorting)
+            for field, val in (("relevance_score", rel_s), ("quality_score", qual_s)):
+                if val > (seen[key].get(field) or 0):
+                    seen[key][field] = val
     return [seen[k] for k in order]
 
 
@@ -485,12 +509,21 @@ def _topic_badge(label: str, color: str) -> str:
     )
 
 
-def _score_pips(score: int, max_score: int = 5) -> str:
+def _score_pips(score: float, max_score: int = 5) -> str:
+    label = f"{score:.1f}" if score != int(score) else str(int(score))
     pips = [
         f'<span class="score-pip {"pip-filled" if i <= score else "pip-empty"}"></span>'
         for i in range(1, max_score + 1)
     ]
-    return f'{"".join(pips)} <small>{score}</small>'
+    return f'{"".join(pips)} <small>{label}</small>'
+
+
+def _avg_score(score_by_topic: dict, active_topics: list[str]) -> float:
+    """Average score across active topics; fall back to all topics if none match."""
+    vals = [score_by_topic[t] for t in active_topics if t in score_by_topic]
+    if not vals:
+        vals = list(score_by_topic.values())
+    return sum(vals) / len(vals) if vals else 0.0
 
 
 def _build_html_table(
@@ -498,6 +531,7 @@ def _build_html_table(
     color_map: dict[str, str],
     sort_col: str,
     sort_asc: bool,
+    selected_topics: list[str],
 ) -> str:
     rows = []
     for p in papers:
@@ -508,25 +542,57 @@ def _build_html_table(
         )
         venue      = html_mod.escape(p.get("venue", "Not specified"))
         summary    = html_mod.escape(p.get("summary", ""))
-        rel_txt    = html_mod.escape(p.get("relevance", ""))
-        qual_txt   = html_mod.escape(p.get("quality", ""))
         url        = p.get("url", "")
         url_esc    = html_mod.escape(url)
-        rel_score  = int(p.get("relevance_score") or 0)
-        qual_score = int(p.get("quality_score")   or 0)
+
+        # Use per-topic score dicts when available, else fall back to flat fields
+        active = selected_topics if selected_topics else topics
+        rel_score  = _avg_score(
+            p.get("relevance_score_by_topic", {}), active
+        ) or int(p.get("relevance_score") or 0)
+        qual_score = _avg_score(
+            p.get("quality_score_by_topic", {}), active
+        ) or int(p.get("quality_score") or 0)
 
         url_cell = (
             f'<a class="paper-link" href="{url_esc}" target="_blank">🔗 Open</a>'
             if url else ""
         )
-        detail = ""
-        if rel_txt or qual_txt:
-            detail = (
-                '<div class="detail-section">'
-                f'<span class="detail-label">Relevance:</span> {rel_txt}<br><br>'
-                f'<span class="detail-label">Quality:</span> {qual_txt}'
-                '</div>'
+
+        # Build per-topic relevance/quality sections
+        rel_by  = p.get("relevance_by_topic", {})
+        qual_by = p.get("quality_by_topic",   {})
+        # Fall back to flat fields for papers loaded from old JSON
+        if not rel_by and p.get("relevance"):
+            tk = topics[0] if topics else ""
+            rel_by  = {tk: p["relevance"]}
+            qual_by = {tk: p.get("quality", "")}
+
+        rel_score_by = p.get("relevance_score_by_topic", {})
+        qual_score_by = p.get("quality_score_by_topic", {})
+
+        topic_sections = []
+        for tk in topics:
+            rel_t  = html_mod.escape(rel_by.get(tk,  ""))
+            qual_t = html_mod.escape(qual_by.get(tk, ""))
+            if not rel_t and not qual_t:
+                continue
+            badge  = _topic_badge(tk, color_map.get(tk, "#888"))
+            rel_s  = rel_score_by.get(tk)
+            qual_s = qual_score_by.get(tk)
+            rel_pip  = f" {_score_pips(rel_s)}"  if rel_s  is not None else ""
+            qual_pip = f" {_score_pips(qual_s)}" if qual_s is not None else ""
+            section = (
+                f'<div class="detail-section">{badge}<br>'
+                + (f'<span class="detail-label">Relevance:</span>{rel_pip} {rel_t}<br><br>'
+                   if rel_t else "")
+                + (f'<span class="detail-label">Quality:</span>{qual_pip} {qual_t}'
+                   if qual_t else "")
+                + '</div>'
             )
+            topic_sections.append(section)
+
+        detail = "".join(topic_sections)
         title_cell = (
             f"<details><summary>{title}</summary>{detail}</details>"
             if detail else title
@@ -859,7 +925,7 @@ def main() -> None:
 
         # ── HTML table ────────────────────────────────────────────────────────
         st.markdown(
-            _build_html_table(papers_sorted, color_map, sc, asc),
+            _build_html_table(papers_sorted, color_map, sc, asc, selected_topics),
             unsafe_allow_html=True,
         )
 
