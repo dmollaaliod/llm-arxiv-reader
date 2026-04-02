@@ -1065,7 +1065,12 @@ def main() -> None:
             def val(k):
                 if k == "topic_key":
                     return ", ".join(sorted(p.get("topics", [p.get("topic_key", "")])))
-                return (p.get(k) or 0) if k.endswith("_score") else (p.get(k) or "").lower()
+                if k.endswith("_score"):
+                    score_by = p.get(f"{k}_by_topic", {})
+                    if score_by:
+                        return _avg_score(score_by, selected_topics)
+                    return p.get(k) or 0
+                return (p.get(k) or "").lower()
             return (val(sc), val(sc2))
 
         papers_sorted = sorted(papers, key=_sort_key, reverse=not asc)
