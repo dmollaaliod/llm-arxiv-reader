@@ -1,0 +1,9 @@
+Question answering
+Text Summarisation
+{"key": "Biomedical NLP", "query": "Biomedical question answering and lay summarisation, with especial emphasis on BioASQ"}
+{"key": "Task oriented", "query": "Task-oriented text-based conversational agents, with especial emphasis on systems that engage with a user to help them formulate optimisation problems. This includes the ability for the system to ask suitable questions"}
+{"key": "Multimodal", "query": "Multimodal summarisation of text and images"}
+Emotion regulation analysis
+{"key": "Mental health", "query": "Mental health conversational agents"}
+Bias detection and correction
+{"key": "Norms and obligations", "query": "Formal modeling of norms and obligations, with especial emphasis on logical frameworks and their implementation"}

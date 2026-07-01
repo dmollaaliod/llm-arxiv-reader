@@ -84,9 +84,11 @@ _DIGEST_WRAPPER = """\
 """
 
 _TOPIC_REQUEST = """\
-Identify all papers from the digest above that are relevant to this topic:
+Identify all papers from the digest above that are strictly relevant to this topic:
 
 **{query}**
+
+Do not return papers that are only tangentially related.
 
 Return only the JSON object.
 """
